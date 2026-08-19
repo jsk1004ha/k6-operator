@@ -37,6 +37,29 @@ func RunSetup(ctx context.Context, hostname string) (_ json.RawMessage, err erro
 	return response.Data.Attributes.Data, nil
 }
 
+func GetSetupData(ctx context.Context, hostname string) (json.RawMessage, error) {
+	c, err := k6Client.New(fmt.Sprintf("%v:6565", hostname), k6Client.WithHTTPClient(&http.Client{
+		Timeout: 0,
+	}))
+	if err != nil {
+		return nil, err
+	}
+
+	var response types.SetupData
+	if err := c.CallAPI(ctx, "GET", &url.URL{Path: "/v1/setup"}, nil, &response); err != nil {
+		return nil, err
+	}
+
+	if response.Data.Attributes.Data != nil {
+		var decoded any
+		if err := json.Unmarshal(response.Data.Attributes.Data, &decoded); err != nil {
+			return nil, err
+		}
+	}
+
+	return response.Data.Attributes.Data, nil
+}
+
 func SetSetupData(ctx context.Context, hostnames []string, data json.RawMessage) (err error) {
 	for _, hostname := range hostnames {
 		c, err := k6Client.New(fmt.Sprintf("%v:6565", hostname), k6Client.WithHTTPClient(&http.Client{

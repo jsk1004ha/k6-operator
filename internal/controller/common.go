@@ -156,33 +156,156 @@ func (r *TestRunReconciler) hostnames(ctx context.Context, log logr.Logger, abor
 	return hostnames, nil
 }
 
-// runSetup returns an outcome of HTTP calls, as well as
-// a retry bool showing whether operation should be retried
-// despite the error.
-// (for example, if there was a networking glitch).
-func runSetup(ctx context.Context, hostnames []string, log logr.Logger) (error, bool) {
+type setupDataClient interface {
+	RunSetup(context.Context, string) (json.RawMessage, error)
+	GetSetupData(context.Context, string) (json.RawMessage, error)
+	SetSetupData(context.Context, []string, json.RawMessage) error
+}
+
+type k6SetupDataClient struct{}
+
+func (k6SetupDataClient) RunSetup(ctx context.Context, hostname string) (json.RawMessage, error) {
+	return testrun.RunSetup(ctx, hostname)
+}
+
+func (k6SetupDataClient) GetSetupData(ctx context.Context, hostname string) (json.RawMessage, error) {
+	return testrun.GetSetupData(ctx, hostname)
+}
+
+func (k6SetupDataClient) SetSetupData(
+	ctx context.Context,
+	hostnames []string,
+	data json.RawMessage,
+) error {
+	return testrun.SetSetupData(ctx, hostnames, data)
+}
+
+const setupMarkerField = "__k6_operator_setup_claim"
+
+type setupRunOutcome int
+
+const (
+	setupRunSucceeded setupRunOutcome = iota
+	setupRunRetryable
+	setupRunFailed
+	setupRunPending
+)
+
+func setupMarkerData(claimID string) json.RawMessage {
+	data, err := json.Marshal(map[string]string{setupMarkerField: claimID})
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+func isSetupMarkerData(data json.RawMessage, claimID string) bool {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(data, &payload); err != nil || len(payload) != 1 {
+		return false
+	}
+
+	rawClaimID, ok := payload[setupMarkerField]
+	if !ok {
+		return false
+	}
+
+	var storedClaimID string
+	return json.Unmarshal(rawClaimID, &storedClaimID) == nil && storedClaimID == claimID
+}
+
+func prepareSetupRunner(
+	ctx context.Context,
+	hostnames []string,
+	claimID string,
+	setupClient setupDataClient,
+) error {
+	if len(hostnames) == 0 {
+		return errors.New("no k6 Service is available to prepare setup")
+	}
+
+	marker := setupMarkerData(claimID)
+	if err := setupClient.SetSetupData(ctx, hostnames[:1], marker); err != nil {
+		return fmt.Errorf("storing setup execution marker: %w", err)
+	}
+
+	stored, err := setupClient.GetSetupData(ctx, hostnames[0])
+	if err != nil {
+		return fmt.Errorf("verifying setup execution marker: %w", err)
+	}
+	if !isSetupMarkerData(stored, claimID) {
+		return errors.New("setup execution marker was not retained by the first runner")
+	}
+	return nil
+}
+
+func recoverSetupData(
+	ctx context.Context,
+	hostnames []string,
+	claimID string,
+	setupClient setupDataClient,
+) (bool, error) {
+	if len(hostnames) == 0 {
+		return false, errors.New("no k6 Service is available to recover setup")
+	}
+
+	setupData, err := setupClient.GetSetupData(ctx, hostnames[0])
+	if err != nil {
+		return false, fmt.Errorf("reading setup recovery data: %w", err)
+	}
+	if isSetupMarkerData(setupData, claimID) {
+		return false, nil
+	}
+
+	if err := setupClient.SetSetupData(ctx, hostnames, setupData); err != nil {
+		return false, fmt.Errorf("redistributing recovered setup data: %w", err)
+	}
+	return true, nil
+}
+
+// runSetup executes a setup that has already been fenced by a persisted
+// Prepared condition and a claim-specific marker on the first runner.
+func runSetup(
+	ctx context.Context,
+	hostnames []string,
+	claimID string,
+	setupClient setupDataClient,
+	log logr.Logger,
+) (setupRunOutcome, error) {
 	log.Info("Invoking setup() on the first runner")
 
-	setupData, err := testrun.RunSetup(ctx, hostnames[0])
+	setupData, err := setupClient.RunSetup(ctx, hostnames[0])
 	if err != nil {
-		// Is there a better way to get this error? Where is NDE...
-		if strings.Contains(err.Error(), "Error executing") {
-			// setup has failed: we need to abort the test
-			return err, false
+		// A lost HTTP response can happen after setup completed. The first
+		// runner's marker is overwritten only by a successful setup, so probe
+		// it before deciding whether the operation is safe to retry.
+		recovered, recoveryErr := recoverSetupData(ctx, hostnames, claimID, setupClient)
+		if recoveryErr != nil {
+			return setupRunPending, errors.Join(err, recoveryErr)
+		}
+		if recovered {
+			return setupRunSucceeded, nil
 		}
 
-		// if we're here, this may be a networking error
-		return err, true
+		if strings.Contains(err.Error(), "Error executing") {
+			return setupRunFailed, err
+		}
+		return setupRunRetryable, err
+	}
+
+	// POST leaves the marker unchanged when the script has no setup export.
+	// Clearing it preserves the original undefined setup-data semantics.
+	if isSetupMarkerData(setupData, claimID) {
+		setupData = nil
 	}
 
 	log.Info("Sending setup data to the runners")
-
-	if err = testrun.SetSetupData(ctx, hostnames, setupData); err != nil {
-		// we cannot retry this operation without preserving setupData somewhere
-		return err, false
+	if err := setupClient.SetSetupData(ctx, hostnames, setupData); err != nil {
+		// The first runner remains the durable source for a later reconcile.
+		return setupRunPending, err
 	}
 
-	return nil, false
+	return setupRunSucceeded, nil
 }
 
 func runTeardown(ctx context.Context, hostnames []string, log logr.Logger) {
