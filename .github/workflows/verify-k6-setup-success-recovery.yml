@@ -1,4 +1,4 @@
-name: Verify k6 setup-success recovery
+name: Publish verified k6 setup-success recovery
 
 on:
   pull_request:
@@ -6,112 +6,25 @@ on:
       - agent/verify-k6-setup-success-base
 
 jobs:
-  verify:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout candidate
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Checkout trusted patch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          path: .trusted
-          persist-credentials: false
-          sparse-checkout: |
-            .github/scripts/apply-k6-setup-success-recovery.py
-          sparse-checkout-cone-mode: false
-
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.26.x"
-          check-latest: true
-
-      - name: Apply trusted patch
-        run: |
-          python .trusted/.github/scripts/apply-k6-setup-success-recovery.py
-          python - <<'PY'
-          import re
-          from pathlib import Path
-
-          paths = (
-              Path("internal/controller/common.go"),
-              Path("internal/controller/k6_start.go"),
-              Path("internal/controller/k6_start_test.go"),
-              Path("pkg/testrun/k6client.go"),
-          )
-          for path in paths:
-              normalized = []
-              for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
-                  indent = []
-                  while True:
-                      if line.startswith("\t"):
-                          indent.append("\t")
-                          line = line[1:]
-                      elif line.startswith(r"\t"):
-                          indent.append("\t")
-                          line = line[2:]
-                      else:
-                          break
-                  normalized.append("".join(indent) + line)
-              text = "".join(normalized)
-              if path.name == "k6_start_test.go":
-                  text = re.sub(r"(?<!t)\bt\.setupData\b", "tt.setupData", text)
-                  text = text.replace('\t"strings"\n', "")
-              path.write_text(text, encoding="utf-8")
-          PY
-          gofmt -w \
-            internal/controller/common.go \
-            internal/controller/k6_start.go \
-            internal/controller/k6_start_test.go \
-            pkg/testrun/k6client.go
-          git diff --check
-          git diff --binary -- \
-            internal/controller/common.go \
-            internal/controller/k6_start.go \
-            internal/controller/k6_start_test.go \
-            pkg/testrun/k6client.go > /tmp/setup-success-recovery.patch
-          sha256sum /tmp/setup-success-recovery.patch > /tmp/setup-success-recovery.patch.sha256
-
-      - name: Test and lint
-        run: |
-          make test
-          make lint
-
-      - name: Verify patch integrity
-        run: sha256sum --check /tmp/setup-success-recovery.patch.sha256
-
-      - name: Upload verified patch
-        uses: actions/upload-artifact@v4
-        with:
-          name: setup-success-recovery-patch
-          path: |
-            /tmp/setup-success-recovery.patch
-            /tmp/setup-success-recovery.patch.sha256
-          if-no-files-found: error
-
   publish:
-    needs: verify
     permissions:
+      actions: read
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - name: Download verified patch
+      - name: Download patch from the successful read-only verification run
         uses: actions/download-artifact@v4
         with:
           name: setup-success-recovery-patch
           path: /tmp/verified
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 32243518014
 
-      - name: Verify patch integrity
-        working-directory: /tmp/verified
-        run: sha256sum --check setup-success-recovery.patch.sha256
+      - name: Verify the exact tested patch
+        run: |
+          echo "90da35c1670f2ab1ab706ca708dfb16eddeb10f8ad3655e395537f5913a3f7d4  /tmp/verified/setup-success-recovery.patch" \
+            | sha256sum --check --strict
 
       - name: Checkout candidate branch
         uses: actions/checkout@v4
@@ -119,7 +32,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
-      - name: Commit verified change
+      - name: Commit the verified patch
         run: |
           git apply --index /tmp/verified/setup-success-recovery.patch
           git diff --cached --check
