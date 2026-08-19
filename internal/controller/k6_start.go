@@ -27,6 +27,16 @@ const (
 	setupExecutionClaimed
 	setupExecutionInProgress
 	setupExecutionCompleted
+	setupExecutionFailed
+)
+
+const (
+	setupExecutionClaimTimeout = 30 * time.Minute
+
+	setupReasonClaimed          = "SetupExecutionClaimed"
+	setupReasonSucceeded        = "SetupExecutionSucceeded"
+	setupReasonRetryableFailure = "SetupExecutionRetryableFailure"
+	setupReasonFailed           = "SetupExecutionFailed"
 )
 
 func setupExecutionAllowsStarter(state setupExecutionState) bool {
@@ -78,18 +88,15 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 		if t, ok := v1alpha1.LastUpdate(k6, v1alpha1.TestRunRunning); !ok {
 			// this should never happen
 			return res, errors.New("cannot find condition TestRunRunning")
-		} else {
-			// let's try this approach
-			if time.Since(t).Minutes() > 5 {
-				msg := fmt.Sprintf(errMessageTooLong, "runner pods", "runner jobs and pods")
-				log.Info(msg)
+		} else if time.Since(t).Minutes() > 5 {
+			msg := fmt.Sprintf(errMessageTooLong, "runner pods", "runner jobs and pods")
+			log.Info(msg)
 
-				if v1alpha1.IsTrue(k6, v1alpha1.CloudTestRun) {
-					events := cloud.ErrorEvent(cloud.K6OperatorStartError).
-						WithDetail(msg).
-						WithAbort()
-					cloud.SendTestRunEvents(cloudClient, k6.TestRunID(), log, events)
-				}
+			if v1alpha1.IsTrue(k6, v1alpha1.CloudTestRun) {
+				events := cloud.ErrorEvent(cloud.K6OperatorStartError).
+					WithDetail(msg).
+					WithAbort()
+				cloud.SendTestRunEvents(cloudClient, k6.TestRunID(), log, events)
 			}
 		}
 
@@ -116,31 +123,46 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 	}
 
 	if setupState == setupExecutionClaimed {
-		if err, retrySetup := runSetup(ctx, hostnames, log); err != nil {
+		if setupErr, retrySetup := runSetup(ctx, hostnames, log); setupErr != nil {
 			if retrySetup {
-				if resetErr := resetSetupExecution(ctx, k6, r, log); resetErr != nil {
-					return ctrl.Result{}, errors.Join(err, resetErr)
+				if phaseErr := markSetupExecutionRetryableFailure(ctx, k6, r, log, setupErr); phaseErr != nil {
+					return ctrl.Result{}, errors.Join(setupErr, phaseErr)
 				}
-				return ctrl.Result{}, err
+				if resetErr := resetSetupExecution(ctx, k6, r, log); resetErr != nil {
+					return ctrl.Result{}, errors.Join(setupErr, resetErr)
+				}
+				return ctrl.Result{}, setupErr
 			}
 
-			log.Error(err, "Setup function failed, requesting abort.")
-			events := cloud.ErrorEvent(cloud.SetupError).
-				WithDetail(fmt.Sprintf("setup function failed: %v", err)).
-				WithAbort()
-			cloud.SendTestRunEvents(cloudClient, k6.TestRunID(), log, events)
-
-			return ctrl.Result{Requeue: false}, nil
+			detail := fmt.Sprintf("setup function failed: %v", setupErr)
+			if phaseErr := markSetupExecutionFailed(ctx, k6, r, log, detail); phaseErr != nil {
+				return ctrl.Result{}, errors.Join(setupErr, phaseErr)
+			}
+			return failSetupExecution(ctx, k6, r, cloudClient, log, detail)
 		}
 
+		if err := markSetupExecutionSucceeded(ctx, k6, r, log); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := completeSetupExecution(ctx, k6, r, log); err != nil {
 			return ctrl.Result{}, err
 		}
 		setupState = setupExecutionCompleted
 	}
 
+	if setupState == setupExecutionFailed {
+		return failSetupExecution(
+			ctx,
+			k6,
+			r,
+			cloudClient,
+			log,
+			setupExecutionFailureMessage(k6),
+		)
+	}
+
 	// A second reconciliation may observe the claim while setup() is still
-	// running (or after a non-retryable failure). It must not start the test.
+	// running. It must not run setup again or create the starter.
 	if !setupExecutionAllowsStarter(setupState) {
 		return res, nil
 	}
@@ -192,12 +214,38 @@ func claimSetupExecution(
 		case metav1.ConditionTrue:
 			return setupExecutionCompleted, nil
 		case metav1.ConditionUnknown:
-			return setupExecutionInProgress, nil
+			switch condition.Reason {
+			case setupReasonSucceeded:
+				if err := completeSetupExecution(ctx, k6, r, log); err != nil {
+					return setupExecutionInProgress, err
+				}
+				return setupExecutionCompleted, nil
+			case setupReasonRetryableFailure:
+				if err := resetSetupExecution(ctx, k6, r, log); err != nil {
+					return setupExecutionInProgress, err
+				}
+				return setupExecutionInProgress, nil
+			case setupReasonFailed:
+				return setupExecutionFailed, nil
+			default:
+				if time.Since(condition.LastTransitionTime.Time) < setupExecutionClaimTimeout {
+					return setupExecutionInProgress, nil
+				}
+
+				detail := fmt.Sprintf(
+					"setup execution claim was not completed within %s; replay is unsafe",
+					setupExecutionClaimTimeout,
+				)
+				if err := markSetupExecutionFailed(ctx, k6, r, log, detail); err != nil {
+					return setupExecutionInProgress, err
+				}
+				return setupExecutionFailed, nil
+			}
 		}
 	}
 
 	base := k6.DeepCopy()
-	v1alpha1.UpdateCondition(k6, v1alpha1.SetupExecuted, metav1.ConditionUnknown)
+	setSetupExecutionCondition(k6, metav1.ConditionUnknown, setupReasonClaimed, "setup execution is claimed")
 	if err := r.Status().Patch(
 		ctx,
 		k6,
@@ -210,13 +258,74 @@ func claimSetupExecution(
 	return setupExecutionClaimed, nil
 }
 
+func markSetupExecutionSucceeded(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) error {
+	return persistSetupExecutionCondition(
+		ctx,
+		k6,
+		r,
+		log,
+		metav1.ConditionUnknown,
+		setupReasonSucceeded,
+		"setup completed; persisting the terminal condition",
+	)
+}
+
+func markSetupExecutionRetryableFailure(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+	setupErr error,
+) error {
+	return persistSetupExecutionCondition(
+		ctx,
+		k6,
+		r,
+		log,
+		metav1.ConditionUnknown,
+		setupReasonRetryableFailure,
+		fmt.Sprintf("retryable setup error: %v", setupErr),
+	)
+}
+
+func markSetupExecutionFailed(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+	detail string,
+) error {
+	return persistSetupExecutionCondition(
+		ctx,
+		k6,
+		r,
+		log,
+		metav1.ConditionUnknown,
+		setupReasonFailed,
+		detail,
+	)
+}
+
 func completeSetupExecution(
 	ctx context.Context,
 	k6 *v1alpha1.TestRun,
 	r *TestRunReconciler,
 	log logr.Logger,
 ) error {
-	return setSetupExecutionCondition(ctx, k6, r, log, metav1.ConditionTrue)
+	return persistSetupExecutionCondition(
+		ctx,
+		k6,
+		r,
+		log,
+		metav1.ConditionTrue,
+		"SetupExecutedTrue",
+		"setup completed successfully",
+	)
 }
 
 func resetSetupExecution(
@@ -225,25 +334,35 @@ func resetSetupExecution(
 	r *TestRunReconciler,
 	log logr.Logger,
 ) error {
-	return setSetupExecutionCondition(ctx, k6, r, log, metav1.ConditionFalse)
+	return persistSetupExecutionCondition(
+		ctx,
+		k6,
+		r,
+		log,
+		metav1.ConditionFalse,
+		"SetupExecutedFalse",
+		"setup may be retried",
+	)
 }
 
-func setSetupExecutionCondition(
+func persistSetupExecutionCondition(
 	ctx context.Context,
 	k6 *v1alpha1.TestRun,
 	r *TestRunReconciler,
 	log logr.Logger,
 	status metav1.ConditionStatus,
+	reason string,
+	message string,
 ) error {
 	key := k6.NamespacedName()
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.OnError(retry.DefaultBackoff, func(error) bool { return true }, func() error {
 		current := &v1alpha1.TestRun{}
 		if err := r.Get(ctx, key, current); err != nil {
 			return err
 		}
 
 		base := current.DeepCopy()
-		v1alpha1.UpdateCondition(current, v1alpha1.SetupExecuted, status)
+		setSetupExecutionCondition(current, status, reason, message)
 		if err := r.Status().Patch(
 			ctx,
 			current,
@@ -256,8 +375,53 @@ func setSetupExecutionCondition(
 		return nil
 	})
 	if err != nil {
-		log.Error(err, "Failed to update setup execution condition", "status", status)
-		return fmt.Errorf("updating setup execution condition to %s: %w", status, err)
+		log.Error(err, "Failed to update setup execution condition", "status", status, "reason", reason)
+		return fmt.Errorf("updating setup execution condition to %s/%s: %w", status, reason, err)
 	}
 	return nil
+}
+
+func setSetupExecutionCondition(
+	k6 *v1alpha1.TestRun,
+	status metav1.ConditionStatus,
+	reason string,
+	message string,
+) {
+	meta.SetStatusCondition(&k6.GetStatus().Conditions, metav1.Condition{
+		Type:               v1alpha1.SetupExecuted,
+		Status:             status,
+		ObservedGeneration: k6.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func setupExecutionFailureMessage(k6 *v1alpha1.TestRun) string {
+	condition := meta.FindStatusCondition(k6.Status.Conditions, v1alpha1.SetupExecuted)
+	if condition != nil && condition.Message != "" {
+		return condition.Message
+	}
+	return "setup execution failed and cannot be replayed safely"
+}
+
+func failSetupExecution(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	cloudClient *cloudapi.Client,
+	log logr.Logger,
+	detail string,
+) (ctrl.Result, error) {
+	log.Error(errors.New(detail), "Setup function failed, requesting abort.")
+	events := cloud.ErrorEvent(cloud.SetupError).
+		WithDetail(detail).
+		WithAbort()
+	cloud.SendTestRunEvents(cloudClient, k6.TestRunID(), log, events)
+
+	k6.GetStatus().Stage = "error"
+	if _, err := r.UpdateStatus(ctx, k6, log); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
