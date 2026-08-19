@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -15,6 +16,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -25,6 +27,7 @@ type setupExecutionState int
 const (
 	setupExecutionNotRequired setupExecutionState = iota
 	setupExecutionClaimed
+	setupExecutionPrepared
 	setupExecutionInProgress
 	setupExecutionCompleted
 	setupExecutionFailed
@@ -34,10 +37,13 @@ const (
 	setupExecutionClaimTimeout = 30 * time.Minute
 
 	setupReasonClaimed          = "SetupExecutionClaimed"
+	setupReasonPrepared         = "SetupExecutionPrepared"
 	setupReasonSucceeded        = "SetupExecutionSucceeded"
 	setupReasonRetryableFailure = "SetupExecutionRetryableFailure"
 	setupReasonFailed           = "SetupExecutionFailed"
 )
+
+const setupClaimMessagePrefix = "claim-id="
 
 var errSetupExecutionConditionChanged = errors.New("setup execution condition changed")
 
@@ -119,39 +125,10 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 
 	// setup
 
-	setupState, err := claimSetupExecution(ctx, k6, r, log)
+	setupState, err := reconcileSetupExecution(ctx, log, k6, r, hostnames, k6SetupDataClient{})
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	if setupState == setupExecutionClaimed {
-		if setupErr, retrySetup := runSetup(ctx, hostnames, log); setupErr != nil {
-			if retrySetup {
-				if phaseErr := markSetupExecutionRetryableFailure(ctx, k6, r, log, setupErr); phaseErr != nil {
-					return ctrl.Result{}, errors.Join(setupErr, phaseErr)
-				}
-				if resetErr := resetSetupExecution(ctx, k6, r, log); resetErr != nil {
-					return ctrl.Result{}, errors.Join(setupErr, resetErr)
-				}
-				return ctrl.Result{}, setupErr
-			}
-
-			detail := fmt.Sprintf("setup function failed: %v", setupErr)
-			if phaseErr := markSetupExecutionFailed(ctx, k6, r, log, setupReasonClaimed, detail); phaseErr != nil {
-				return ctrl.Result{}, errors.Join(setupErr, phaseErr)
-			}
-			return failSetupExecution(ctx, k6, r, cloudClient, log, detail)
-		}
-
-		if err := markSetupExecutionSucceeded(ctx, k6, r, log); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := completeSetupExecution(ctx, k6, r, log); err != nil {
-			return ctrl.Result{}, err
-		}
-		setupState = setupExecutionCompleted
-	}
-
 	if setupState == setupExecutionFailed {
 		return failSetupExecution(
 			ctx,
@@ -162,9 +139,6 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 			setupExecutionFailureMessage(k6),
 		)
 	}
-
-	// A second reconciliation may observe the claim while setup() is still
-	// running. It must not run setup again or create the starter.
 	if !setupExecutionAllowsStarter(setupState) {
 		return res, nil
 	}
@@ -201,6 +175,118 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 	return ctrl.Result{}, nil
 }
 
+func reconcileSetupExecution(
+	ctx context.Context,
+	log logr.Logger,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	hostnames []string,
+	setupClient setupDataClient,
+) (setupExecutionState, error) {
+	setupState, err := claimSetupExecution(ctx, k6, r, log)
+	if err != nil {
+		return setupExecutionInProgress, err
+	}
+
+	switch setupState {
+	case setupExecutionClaimed:
+		claimID := setupExecutionClaimID(k6)
+		if claimID == "" {
+			return setupExecutionInProgress, errors.New("setup execution claim is missing its ID")
+		}
+
+		if err := prepareSetupRunner(ctx, hostnames, claimID, setupClient); err != nil {
+			releaseErr := releaseSetupExecutionClaim(ctx, k6, r, log)
+			if releaseErr != nil {
+				return setupExecutionInProgress, errors.Join(err, releaseErr)
+			}
+			return setupExecutionInProgress, err
+		}
+		if err := markSetupExecutionPrepared(ctx, k6, r, log); err != nil {
+			return setupExecutionInProgress, err
+		}
+
+		outcome, setupErr := runSetup(ctx, hostnames, claimID, setupClient, log)
+		switch outcome {
+		case setupRunSucceeded:
+			return finishSetupExecution(ctx, k6, r, log)
+		case setupRunRetryable:
+			if phaseErr := markSetupExecutionRetryableFailure(ctx, k6, r, log, setupErr); phaseErr != nil {
+				return setupExecutionInProgress, errors.Join(setupErr, phaseErr)
+			}
+			if resetErr := resetSetupExecution(ctx, k6, r, log); resetErr != nil {
+				return setupExecutionInProgress, errors.Join(setupErr, resetErr)
+			}
+			return setupExecutionInProgress, setupErr
+		case setupRunFailed:
+			detail := fmt.Sprintf("setup function failed: %v", setupErr)
+			if phaseErr := markSetupExecutionFailed(
+				ctx,
+				k6,
+				r,
+				log,
+				setupReasonPrepared,
+				detail,
+			); phaseErr != nil {
+				return setupExecutionInProgress, errors.Join(setupErr, phaseErr)
+			}
+			return setupExecutionFailed, nil
+		case setupRunPending:
+			return setupExecutionPrepared, setupErr
+		default:
+			return setupExecutionInProgress, errors.New("unknown setup execution outcome")
+		}
+
+	case setupExecutionPrepared:
+		claimID := setupExecutionClaimID(k6)
+		recovered, recoverErr := recoverSetupData(ctx, hostnames, claimID, setupClient)
+		if recoverErr != nil {
+			return setupExecutionInProgress, recoverErr
+		}
+		if recovered {
+			return finishSetupExecution(ctx, k6, r, log)
+		}
+
+		condition := meta.FindStatusCondition(k6.Status.Conditions, v1alpha1.SetupExecuted)
+		if condition != nil && time.Since(condition.LastTransitionTime.Time) >= setupExecutionClaimTimeout {
+			detail := fmt.Sprintf(
+				"prepared setup did not produce a completion marker within %s; replay is unsafe",
+				setupExecutionClaimTimeout,
+			)
+			if err := markSetupExecutionFailed(
+				ctx,
+				k6,
+				r,
+				log,
+				setupReasonPrepared,
+				detail,
+			); err != nil {
+				return setupExecutionInProgress, err
+			}
+			return setupExecutionFailed, nil
+		}
+		return setupExecutionInProgress, nil
+
+	default:
+		return setupState, nil
+	}
+}
+
+func finishSetupExecution(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) (setupExecutionState, error) {
+	if err := markSetupExecutionSucceeded(ctx, k6, r, log); err != nil {
+		return setupExecutionInProgress, err
+	}
+	if err := completeSetupExecution(ctx, k6, r, log); err != nil {
+		return setupExecutionInProgress, err
+	}
+	return setupExecutionCompleted, nil
+}
+
 func claimSetupExecution(
 	ctx context.Context,
 	k6 *v1alpha1.TestRun,
@@ -229,16 +315,35 @@ func claimSetupExecution(
 				return setupExecutionInProgress, nil
 			case setupReasonFailed:
 				return setupExecutionFailed, nil
+			case setupReasonPrepared:
+				return setupExecutionPrepared, nil
+			case setupReasonClaimed:
+				if time.Since(condition.LastTransitionTime.Time) < setupExecutionClaimTimeout {
+					return setupExecutionInProgress, nil
+				}
+				// A setup is never invoked before the Prepared phase is durable,
+				// so an orphaned Claim can be released without replay risk.
+				if err := releaseSetupExecutionClaim(ctx, k6, r, log); err != nil {
+					return setupExecutionInProgress, err
+				}
+				return setupExecutionInProgress, nil
 			default:
 				if time.Since(condition.LastTransitionTime.Time) < setupExecutionClaimTimeout {
 					return setupExecutionInProgress, nil
 				}
-
 				detail := fmt.Sprintf(
-					"setup execution claim was not completed within %s; replay is unsafe",
+					"setup execution state %q was not completed within %s; replay is unsafe",
+					condition.Reason,
 					setupExecutionClaimTimeout,
 				)
-				if err := markSetupExecutionFailed(ctx, k6, r, log, condition.Reason, detail); err != nil {
+				if err := markSetupExecutionFailed(
+					ctx,
+					k6,
+					r,
+					log,
+					condition.Reason,
+					detail,
+				); err != nil {
 					return setupExecutionInProgress, err
 				}
 				return setupExecutionFailed, nil
@@ -246,8 +351,15 @@ func claimSetupExecution(
 		}
 	}
 
+	claimID := string(uuid.NewUUID())
 	base := k6.DeepCopy()
-	setSetupExecutionCondition(k6, metav1.ConditionUnknown, setupReasonClaimed, "setup execution is claimed")
+	setSetupExecutionCondition(
+		k6,
+		metav1.ConditionUnknown,
+		setupReasonClaimed,
+		claimID,
+		"setup execution is claimed",
+	)
 	if err := r.Status().Patch(
 		ctx,
 		k6,
@@ -258,6 +370,24 @@ func claimSetupExecution(
 	}
 
 	return setupExecutionClaimed, nil
+}
+
+func markSetupExecutionPrepared(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) error {
+	return persistSetupExecutionCondition(
+		ctx,
+		k6,
+		r,
+		log,
+		setupReasonClaimed,
+		metav1.ConditionUnknown,
+		setupReasonPrepared,
+		"setup execution marker is durable; setup may start",
+	)
 }
 
 func markSetupExecutionSucceeded(
@@ -271,7 +401,7 @@ func markSetupExecutionSucceeded(
 		k6,
 		r,
 		log,
-		setupReasonClaimed,
+		setupReasonPrepared,
 		metav1.ConditionUnknown,
 		setupReasonSucceeded,
 		"setup completed; persisting the terminal condition",
@@ -290,7 +420,7 @@ func markSetupExecutionRetryableFailure(
 		k6,
 		r,
 		log,
-		setupReasonClaimed,
+		setupReasonPrepared,
 		metav1.ConditionUnknown,
 		setupReasonRetryableFailure,
 		fmt.Sprintf("retryable setup error: %v", setupErr),
@@ -353,6 +483,24 @@ func resetSetupExecution(
 	)
 }
 
+func releaseSetupExecutionClaim(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) error {
+	return persistSetupExecutionCondition(
+		ctx,
+		k6,
+		r,
+		log,
+		setupReasonClaimed,
+		metav1.ConditionFalse,
+		"SetupExecutedFalse",
+		"setup claim was released before execution began",
+	)
+}
+
 func persistSetupExecutionCondition(
 	ctx context.Context,
 	k6 *v1alpha1.TestRun,
@@ -361,36 +509,42 @@ func persistSetupExecutionCondition(
 	expectedReason string,
 	status metav1.ConditionStatus,
 	reason string,
-	message string,
+	detail string,
 ) error {
 	key := k6.NamespacedName()
-	err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return !errors.Is(err, errSetupExecutionConditionChanged) }, func() error {
-		current := &v1alpha1.TestRun{}
-		if err := r.Get(ctx, key, current); err != nil {
-			return err
-		}
+	expectedClaimID := setupExecutionClaimID(k6)
+	err := retry.OnError(
+		retry.DefaultBackoff,
+		func(err error) bool { return !errors.Is(err, errSetupExecutionConditionChanged) },
+		func() error {
+			current := &v1alpha1.TestRun{}
+			if err := r.Get(ctx, key, current); err != nil {
+				return err
+			}
 
-		condition := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.SetupExecuted)
-		if condition == nil ||
-			condition.Status != metav1.ConditionUnknown ||
-			condition.Reason != expectedReason {
+			condition := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.SetupExecuted)
+			if condition == nil ||
+				condition.Status != metav1.ConditionUnknown ||
+				condition.Reason != expectedReason ||
+				setupExecutionClaimIDFromCondition(condition) != expectedClaimID {
+				current.DeepCopyInto(k6)
+				return errSetupExecutionConditionChanged
+			}
+
+			base := current.DeepCopy()
+			setSetupExecutionCondition(current, status, reason, expectedClaimID, detail)
+			if err := r.Status().Patch(
+				ctx,
+				current,
+				client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}),
+			); err != nil {
+				return err
+			}
+
 			current.DeepCopyInto(k6)
-			return errSetupExecutionConditionChanged
-		}
-
-		base := current.DeepCopy()
-		setSetupExecutionCondition(current, status, reason, message)
-		if err := r.Status().Patch(
-			ctx,
-			current,
-			client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}),
-		); err != nil {
-			return err
-		}
-
-		current.DeepCopyInto(k6)
-		return nil
-	})
+			return nil
+		},
+	)
 	if err != nil {
 		log.Error(err, "Failed to update setup execution condition", "status", status, "reason", reason)
 		return fmt.Errorf("updating setup execution condition to %s/%s: %w", status, reason, err)
@@ -402,7 +556,8 @@ func setSetupExecutionCondition(
 	k6 *v1alpha1.TestRun,
 	status metav1.ConditionStatus,
 	reason string,
-	message string,
+	claimID string,
+	detail string,
 ) {
 	meta.SetStatusCondition(&k6.GetStatus().Conditions, metav1.Condition{
 		Type:               v1alpha1.SetupExecuted,
@@ -410,14 +565,55 @@ func setSetupExecutionCondition(
 		ObservedGeneration: k6.Generation,
 		LastTransitionTime: metav1.Now(),
 		Reason:             reason,
-		Message:            message,
+		Message:            setupExecutionConditionMessage(claimID, detail),
 	})
+}
+
+func setupExecutionConditionMessage(claimID string, detail string) string {
+	if claimID == "" {
+		return detail
+	}
+	if detail == "" {
+		return setupClaimMessagePrefix + claimID
+	}
+	return setupClaimMessagePrefix + claimID + "; " + detail
+}
+
+func setupExecutionClaimID(k6 *v1alpha1.TestRun) string {
+	return setupExecutionClaimIDFromCondition(
+		meta.FindStatusCondition(k6.Status.Conditions, v1alpha1.SetupExecuted),
+	)
+}
+
+func setupExecutionClaimIDFromCondition(condition *metav1.Condition) string {
+	if condition == nil {
+		return ""
+	}
+	remainder, ok := strings.CutPrefix(condition.Message, setupClaimMessagePrefix)
+	if !ok {
+		return ""
+	}
+	claimID, _, _ := strings.Cut(remainder, ";")
+	return strings.TrimSpace(claimID)
+}
+
+func setupExecutionConditionDetail(condition *metav1.Condition) string {
+	if condition == nil {
+		return ""
+	}
+	if _, detail, ok := strings.Cut(condition.Message, "; "); ok {
+		return detail
+	}
+	if strings.HasPrefix(condition.Message, setupClaimMessagePrefix) {
+		return ""
+	}
+	return condition.Message
 }
 
 func setupExecutionFailureMessage(k6 *v1alpha1.TestRun) string {
 	condition := meta.FindStatusCondition(k6.Status.Conditions, v1alpha1.SetupExecuted)
-	if condition != nil && condition.Message != "" {
-		return condition.Message
+	if detail := setupExecutionConditionDetail(condition); detail != "" {
+		return detail
 	}
 	return "setup execution failed and cannot be replayed safely"
 }

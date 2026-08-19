@@ -2,8 +2,8 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -164,6 +164,10 @@ func TestResetSetupExecutionAllowsRetry(t *testing.T) {
 		t.Fatalf("setup execution state = %v, want %v", state, setupExecutionClaimed)
 	}
 
+	if err := markSetupExecutionPrepared(ctx, current, r, logr.Discard()); err != nil {
+		t.Fatalf("markSetupExecutionPrepared() error = %v", err)
+	}
+
 	if err := markSetupExecutionRetryableFailure(
 		ctx,
 		current,
@@ -210,6 +214,10 @@ func TestCompleteSetupExecutionAllowsStarter(t *testing.T) {
 		t.Fatalf("setup execution state = %v, want %v", state, setupExecutionClaimed)
 	}
 
+	if err := markSetupExecutionPrepared(ctx, current, r, logr.Discard()); err != nil {
+		t.Fatalf("markSetupExecutionPrepared() error = %v", err)
+	}
+
 	if err := markSetupExecutionSucceeded(ctx, current, r, logr.Discard()); err != nil {
 		t.Fatalf("markSetupExecutionSucceeded() error = %v", err)
 	}
@@ -252,6 +260,9 @@ func TestClaimHolderCannotOverwriteTerminalFailure(t *testing.T) {
 	if state != setupExecutionClaimed {
 		t.Fatalf("setup execution state = %v, want %v", state, setupExecutionClaimed)
 	}
+	if err := markSetupExecutionPrepared(ctx, claimHolder, r, logr.Discard()); err != nil {
+		t.Fatalf("markSetupExecutionPrepared() error = %v", err)
+	}
 	staleClaimHolder := claimHolder.DeepCopy()
 
 	timeoutReconciler := getSetupConditionTestRun(t, ctx, r, objectKey)
@@ -260,7 +271,7 @@ func TestClaimHolderCannotOverwriteTerminalFailure(t *testing.T) {
 		timeoutReconciler,
 		r,
 		logr.Discard(),
-		setupReasonClaimed,
+		setupReasonPrepared,
 		"setup execution claim timed out",
 	); err != nil {
 		t.Fatalf("markSetupExecutionFailed() error = %v", err)
@@ -362,7 +373,7 @@ func TestClaimSetupExecutionRecoversPersistedPhases(t *testing.T) {
 	}
 }
 
-func TestClaimSetupExecutionExpiresOrphanedClaim(t *testing.T) {
+func TestClaimSetupExecutionReleasesOrphanedUnpreparedClaim(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -381,17 +392,126 @@ func TestClaimSetupExecutionExpiresOrphanedClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claimSetupExecution() error = %v", err)
 	}
-	if state != setupExecutionFailed {
-		t.Fatalf("state = %v, want %v", state, setupExecutionFailed)
+	if state != setupExecutionInProgress {
+		t.Fatalf("state = %v, want %v", state, setupExecutionInProgress)
 	}
 
 	persisted := getSetupConditionTestRun(t, ctx, r, objectKey)
-	condition := meta.FindStatusCondition(persisted.Status.Conditions, v1alpha1.SetupExecuted)
-	if condition.Reason != setupReasonFailed {
-		t.Errorf("reason = %q, want %q", condition.Reason, setupReasonFailed)
+	if !v1alpha1.IsFalse(persisted, v1alpha1.SetupExecuted) {
+		t.Error("orphaned pre-execution claim was not released")
 	}
-	if !strings.Contains(condition.Message, "replay is unsafe") {
-		t.Errorf("unexpected failure message: %q", condition.Message)
+}
+
+type fakeSetupDataClient struct {
+	dataByHostname map[string]json.RawMessage
+	runData        json.RawMessage
+	runErr         error
+}
+
+func newFakeSetupDataClient() *fakeSetupDataClient {
+	return &fakeSetupDataClient{dataByHostname: make(map[string]json.RawMessage)}
+}
+
+func (f *fakeSetupDataClient) RunSetup(_ context.Context, hostname string) (json.RawMessage, error) {
+	if f.runErr != nil {
+		return nil, f.runErr
+	}
+	f.dataByHostname[hostname] = append(json.RawMessage(nil), f.runData...)
+	return append(json.RawMessage(nil), f.runData...), nil
+}
+
+func (f *fakeSetupDataClient) GetSetupData(
+	_ context.Context,
+	hostname string,
+) (json.RawMessage, error) {
+	return append(json.RawMessage(nil), f.dataByHostname[hostname]...), nil
+}
+
+func (f *fakeSetupDataClient) SetSetupData(
+	_ context.Context,
+	hostnames []string,
+	data json.RawMessage,
+) error {
+	for _, hostname := range hostnames {
+		f.dataByHostname[hostname] = append(json.RawMessage(nil), data...)
+	}
+	return nil
+}
+
+func TestPreparedSetupRecoversAfterClaimHolderExit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		setupData json.RawMessage
+	}{
+		{name: "object setup data", setupData: json.RawMessage(`{"value":1}`)},
+		{name: "undefined setup data", setupData: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			r, objectKey := setupConditionTestReconciler(
+				t,
+				setupConditionTestRun(true, conditionStatus(metav1.ConditionFalse)),
+			)
+			claimHolder := getSetupConditionTestRun(t, ctx, r, objectKey)
+			state, err := claimSetupExecution(ctx, claimHolder, r, logr.Discard())
+			if err != nil {
+				t.Fatalf("claimSetupExecution() error = %v", err)
+			}
+			if state != setupExecutionClaimed {
+				t.Fatalf("state = %v, want %v", state, setupExecutionClaimed)
+			}
+
+			hostnames := []string{"runner-0", "runner-1"}
+			setupClient := newFakeSetupDataClient()
+			claimID := setupExecutionClaimID(claimHolder)
+			if err := prepareSetupRunner(ctx, hostnames, claimID, setupClient); err != nil {
+				t.Fatalf("prepareSetupRunner() error = %v", err)
+			}
+			if err := markSetupExecutionPrepared(ctx, claimHolder, r, logr.Discard()); err != nil {
+				t.Fatalf("markSetupExecutionPrepared() error = %v", err)
+			}
+
+			// Simulate setup returning successfully and the claim holder exiting
+			// before it can persist SetupExecutionSucceeded.
+			setupClient.dataByHostname[hostnames[0]] = append(json.RawMessage(nil), tt.setupData...)
+
+			reconciled := getSetupConditionTestRun(t, ctx, r, objectKey)
+			state, err = reconcileSetupExecution(
+				ctx,
+				logr.Discard(),
+				reconciled,
+				r,
+				hostnames,
+				setupClient,
+			)
+			if err != nil {
+				t.Fatalf("reconcileSetupExecution() error = %v", err)
+			}
+			if state != setupExecutionCompleted {
+				t.Fatalf("state = %v, want %v", state, setupExecutionCompleted)
+			}
+
+			persisted := getSetupConditionTestRun(t, ctx, r, objectKey)
+			if !v1alpha1.IsTrue(persisted, v1alpha1.SetupExecuted) {
+				t.Error("recovered setup was not marked complete")
+			}
+			for _, hostname := range hostnames {
+				if string(setupClient.dataByHostname[hostname]) != string(tt.setupData) {
+					t.Errorf(
+						"setup data for %s = %q, want %q",
+						hostname,
+						setupClient.dataByHostname[hostname],
+						tt.setupData,
+					)
+				}
+			}
+		})
 	}
 }
 
@@ -404,6 +524,7 @@ func TestSetupExecutionAllowsStarter(t *testing.T) {
 	}{
 		{state: setupExecutionNotRequired, want: true},
 		{state: setupExecutionClaimed, want: false},
+		{state: setupExecutionPrepared, want: false},
 		{state: setupExecutionInProgress, want: false},
 		{state: setupExecutionCompleted, want: true},
 		{state: setupExecutionFailed, want: false},
