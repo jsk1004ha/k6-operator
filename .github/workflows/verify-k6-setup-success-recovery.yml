@@ -37,6 +37,23 @@ jobs:
       - name: Apply trusted patch
         run: |
           python .trusted/.github/scripts/apply-k6-setup-success-recovery.py
+          python - <<'PY'
+          from pathlib import Path
+
+          paths = (
+              Path("internal/controller/common.go"),
+              Path("internal/controller/k6_start.go"),
+              Path("internal/controller/k6_start_test.go"),
+              Path("pkg/testrun/k6client.go"),
+          )
+          for path in paths:
+              normalized = []
+              for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+                  while line.startswith(r"\t"):
+                      line = "\t" + line[2:]
+                  normalized.append(line)
+              path.write_text("".join(normalized), encoding="utf-8")
+          PY
           gofmt -w \
             internal/controller/common.go \
             internal/controller/k6_start.go \
