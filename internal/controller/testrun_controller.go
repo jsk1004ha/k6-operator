@@ -43,7 +43,8 @@ import (
 )
 
 const (
-	k6CrLabelName = "k6_cr"
+	k6CrLabelName    = "k6_cr"
+	testRunFinalizer = "testruns.k6.io/finalizer"
 )
 
 // TestRunReconciler reconciles a K6 object
@@ -79,6 +80,17 @@ func (r *TestRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		log.Error(err, "Could not fetch request")
 		return ctrl.Result{Requeue: true}, err
+	}
+
+	if !k6.DeletionTimestamp.IsZero() {
+		return r.finalizeTestRun(ctx, k6, log)
+	}
+
+	if finalizerAdded, err := r.ensureTestRunFinalizer(ctx, k6); err != nil {
+		log.Error(err, "Could not add TestRun finalizer")
+		return ctrl.Result{}, err
+	} else if finalizerAdded {
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	if k6.Spec.Parallelism < 1 {
