@@ -39,6 +39,8 @@ const (
 	setupReasonFailed           = "SetupExecutionFailed"
 )
 
+var errSetupExecutionConditionChanged = errors.New("setup execution condition changed")
+
 func setupExecutionAllowsStarter(state setupExecutionState) bool {
 	return state == setupExecutionNotRequired || state == setupExecutionCompleted
 }
@@ -135,7 +137,7 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 			}
 
 			detail := fmt.Sprintf("setup function failed: %v", setupErr)
-			if phaseErr := markSetupExecutionFailed(ctx, k6, r, log, detail); phaseErr != nil {
+			if phaseErr := markSetupExecutionFailed(ctx, k6, r, log, setupReasonClaimed, detail); phaseErr != nil {
 				return ctrl.Result{}, errors.Join(setupErr, phaseErr)
 			}
 			return failSetupExecution(ctx, k6, r, cloudClient, log, detail)
@@ -236,7 +238,7 @@ func claimSetupExecution(
 					"setup execution claim was not completed within %s; replay is unsafe",
 					setupExecutionClaimTimeout,
 				)
-				if err := markSetupExecutionFailed(ctx, k6, r, log, detail); err != nil {
+				if err := markSetupExecutionFailed(ctx, k6, r, log, condition.Reason, detail); err != nil {
 					return setupExecutionInProgress, err
 				}
 				return setupExecutionFailed, nil
@@ -269,6 +271,7 @@ func markSetupExecutionSucceeded(
 		k6,
 		r,
 		log,
+		setupReasonClaimed,
 		metav1.ConditionUnknown,
 		setupReasonSucceeded,
 		"setup completed; persisting the terminal condition",
@@ -287,6 +290,7 @@ func markSetupExecutionRetryableFailure(
 		k6,
 		r,
 		log,
+		setupReasonClaimed,
 		metav1.ConditionUnknown,
 		setupReasonRetryableFailure,
 		fmt.Sprintf("retryable setup error: %v", setupErr),
@@ -298,6 +302,7 @@ func markSetupExecutionFailed(
 	k6 *v1alpha1.TestRun,
 	r *TestRunReconciler,
 	log logr.Logger,
+	expectedReason string,
 	detail string,
 ) error {
 	return persistSetupExecutionCondition(
@@ -305,6 +310,7 @@ func markSetupExecutionFailed(
 		k6,
 		r,
 		log,
+		expectedReason,
 		metav1.ConditionUnknown,
 		setupReasonFailed,
 		detail,
@@ -322,6 +328,7 @@ func completeSetupExecution(
 		k6,
 		r,
 		log,
+		setupReasonSucceeded,
 		metav1.ConditionTrue,
 		"SetupExecutedTrue",
 		"setup completed successfully",
@@ -339,6 +346,7 @@ func resetSetupExecution(
 		k6,
 		r,
 		log,
+		setupReasonRetryableFailure,
 		metav1.ConditionFalse,
 		"SetupExecutedFalse",
 		"setup may be retried",
@@ -350,15 +358,24 @@ func persistSetupExecutionCondition(
 	k6 *v1alpha1.TestRun,
 	r *TestRunReconciler,
 	log logr.Logger,
+	expectedReason string,
 	status metav1.ConditionStatus,
 	reason string,
 	message string,
 ) error {
 	key := k6.NamespacedName()
-	err := retry.OnError(retry.DefaultBackoff, func(error) bool { return true }, func() error {
+	err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return !errors.Is(err, errSetupExecutionConditionChanged) }, func() error {
 		current := &v1alpha1.TestRun{}
 		if err := r.Get(ctx, key, current); err != nil {
 			return err
+		}
+
+		condition := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.SetupExecuted)
+		if condition == nil ||
+			condition.Status != metav1.ConditionUnknown ||
+			condition.Reason != expectedReason {
+			current.DeepCopyInto(k6)
+			return errSetupExecutionConditionChanged
 		}
 
 		base := current.DeepCopy()

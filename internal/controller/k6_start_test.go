@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -163,6 +164,16 @@ func TestResetSetupExecutionAllowsRetry(t *testing.T) {
 		t.Fatalf("setup execution state = %v, want %v", state, setupExecutionClaimed)
 	}
 
+	if err := markSetupExecutionRetryableFailure(
+		ctx,
+		current,
+		r,
+		logr.Discard(),
+		errors.New("temporary network error"),
+	); err != nil {
+		t.Fatalf("markSetupExecutionRetryableFailure() error = %v", err)
+	}
+
 	if err := resetSetupExecution(ctx, current, r, logr.Discard()); err != nil {
 		t.Fatalf("resetSetupExecution() error = %v", err)
 	}
@@ -199,6 +210,10 @@ func TestCompleteSetupExecutionAllowsStarter(t *testing.T) {
 		t.Fatalf("setup execution state = %v, want %v", state, setupExecutionClaimed)
 	}
 
+	if err := markSetupExecutionSucceeded(ctx, current, r, logr.Discard()); err != nil {
+		t.Fatalf("markSetupExecutionSucceeded() error = %v", err)
+	}
+
 	if err := completeSetupExecution(ctx, current, r, logr.Discard()); err != nil {
 		t.Fatalf("completeSetupExecution() error = %v", err)
 	}
@@ -217,6 +232,66 @@ func TestCompleteSetupExecutionAllowsStarter(t *testing.T) {
 	}
 	if !setupExecutionAllowsStarter(state) {
 		t.Error("completed setup did not allow starter creation")
+	}
+}
+
+func TestClaimHolderCannotOverwriteTerminalFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	r, objectKey := setupConditionTestReconciler(
+		t,
+		setupConditionTestRun(true, conditionStatus(metav1.ConditionFalse)),
+	)
+	claimHolder := getSetupConditionTestRun(t, ctx, r, objectKey)
+
+	state, err := claimSetupExecution(ctx, claimHolder, r, logr.Discard())
+	if err != nil {
+		t.Fatalf("claimSetupExecution() error = %v", err)
+	}
+	if state != setupExecutionClaimed {
+		t.Fatalf("setup execution state = %v, want %v", state, setupExecutionClaimed)
+	}
+	staleClaimHolder := claimHolder.DeepCopy()
+
+	timeoutReconciler := getSetupConditionTestRun(t, ctx, r, objectKey)
+	if err := markSetupExecutionFailed(
+		ctx,
+		timeoutReconciler,
+		r,
+		logr.Discard(),
+		setupReasonClaimed,
+		"setup execution claim timed out",
+	); err != nil {
+		t.Fatalf("markSetupExecutionFailed() error = %v", err)
+	}
+
+	err = markSetupExecutionSucceeded(ctx, staleClaimHolder, r, logr.Discard())
+	if !errors.Is(err, errSetupExecutionConditionChanged) {
+		t.Fatalf("markSetupExecutionSucceeded() error = %v, want state-change rejection", err)
+	}
+
+	persisted := getSetupConditionTestRun(t, ctx, r, objectKey)
+	condition := meta.FindStatusCondition(persisted.Status.Conditions, v1alpha1.SetupExecuted)
+	if condition == nil {
+		t.Fatal("SetupExecuted condition is missing")
+	}
+	if condition.Status != metav1.ConditionUnknown {
+		t.Errorf("status = %v, want %v", condition.Status, metav1.ConditionUnknown)
+	}
+	if condition.Reason != setupReasonFailed {
+		t.Errorf("reason = %q, want %q", condition.Reason, setupReasonFailed)
+	}
+
+	state, err = claimSetupExecution(ctx, persisted, r, logr.Discard())
+	if err != nil {
+		t.Fatalf("claimSetupExecution() after terminal failure error = %v", err)
+	}
+	if state != setupExecutionFailed {
+		t.Errorf("state = %v, want %v", state, setupExecutionFailed)
+	}
+	if setupExecutionAllowsStarter(state) {
+		t.Error("terminal setup failure unexpectedly allowed starter creation")
 	}
 }
 
