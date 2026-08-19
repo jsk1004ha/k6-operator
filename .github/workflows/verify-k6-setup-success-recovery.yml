@@ -64,6 +64,7 @@ jobs:
               text = "".join(normalized)
               if path.name == "k6_start_test.go":
                   text = re.sub(r"(?<!t)\bt\.setupData\b", "tt.setupData", text)
+                  text = text.replace('\t"strings"\n', "")
               path.write_text(text, encoding="utf-8")
           PY
           gofmt -w \
