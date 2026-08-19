@@ -1,0 +1,99 @@
+name: Verify k6 setup-success recovery
+
+on:
+  pull_request:
+    branches:
+      - agent/verify-k6-setup-success-base
+
+jobs:
+  verify:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Checkout trusted patch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .trusted
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/apply-k6-setup-success-recovery.py
+          sparse-checkout-cone-mode: false
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+
+      - name: Apply trusted patch
+        run: |
+          python .trusted/.github/scripts/apply-k6-setup-success-recovery.py
+          gofmt -w \
+            internal/controller/common.go \
+            internal/controller/k6_start.go \
+            internal/controller/k6_start_test.go \
+            pkg/testrun/k6client.go
+          git diff --check
+          git diff --binary -- \
+            internal/controller/common.go \
+            internal/controller/k6_start.go \
+            internal/controller/k6_start_test.go \
+            pkg/testrun/k6client.go > /tmp/setup-success-recovery.patch
+          sha256sum /tmp/setup-success-recovery.patch > /tmp/setup-success-recovery.patch.sha256
+
+      - name: Test and lint
+        run: |
+          make test
+          make lint
+
+      - name: Verify patch integrity
+        run: sha256sum --check /tmp/setup-success-recovery.patch.sha256
+
+      - name: Upload verified patch
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-success-recovery-patch
+          path: |
+            /tmp/setup-success-recovery.patch
+            /tmp/setup-success-recovery.patch.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: verify
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified patch
+        uses: actions/download-artifact@v4
+        with:
+          name: setup-success-recovery-patch
+          path: /tmp/verified
+
+      - name: Verify patch integrity
+        working-directory: /tmp/verified
+        run: sha256sum --check setup-success-recovery.patch.sha256
+
+      - name: Checkout candidate branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Commit verified change
+        run: |
+          git apply --index /tmp/verified/setup-success-recovery.patch
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: recover setup success after reconciler exit"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
