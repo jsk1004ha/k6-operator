@@ -1,26 +1,29 @@
 ---
 name: "Unit Test"
-permissions:
-  contents: write
+permissions: {}
 on:
-  pull_request:
+  - push
+  - pull_request
 jobs:
-  verify-anydoc:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      matrix:
+        go-version: ["1.26.x"]
+        k8s_version: [1.27.1, 1.30.0, 1.34.1]
+        os: [ubuntu-x64]
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout bridge repository
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+      - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - name: Verify and export anydoc review fix
-        run: bash .github/scripts/verify-anydoc-review-fix.sh
-      - name: Upload verified anydoc sources
-        uses: actions/upload-artifact@v4
-        with:
-          name: anydoc-verified-sources
-          path: |
-            /tmp/anydoc/src/formats/rtf/mod.rs
-            /tmp/anydoc/src/formats/csv.rs
-          if-no-files-found: error
+          persist-credentials: false
+      - name: Test
+        run: |
+          make test
+        env:
+          ENVTEST_K8S_VERSION: ${{ matrix.k8s_version }}
