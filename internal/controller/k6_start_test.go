@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,8 +23,10 @@ func TestClaimSetupExecution(t *testing.T) {
 		name        string
 		plz         bool
 		setupStatus *metav1.ConditionStatus
+		setupReason string
 		wantState   setupExecutionState
 		wantStatus  metav1.ConditionStatus
+		wantReason  string
 	}{
 		{
 			name:        "claims an unexecuted PLZ setup",
@@ -31,6 +34,7 @@ func TestClaimSetupExecution(t *testing.T) {
 			setupStatus: conditionStatus(metav1.ConditionFalse),
 			wantState:   setupExecutionClaimed,
 			wantStatus:  metav1.ConditionUnknown,
+			wantReason:  setupReasonClaimed,
 		},
 		{
 			name:        "recognizes a completed PLZ setup",
@@ -38,25 +42,30 @@ func TestClaimSetupExecution(t *testing.T) {
 			setupStatus: conditionStatus(metav1.ConditionTrue),
 			wantState:   setupExecutionCompleted,
 			wantStatus:  metav1.ConditionTrue,
+			wantReason:  v1alpha1.SetupExecuted + string(metav1.ConditionTrue),
 		},
 		{
-			name:        "waits for a claimed PLZ setup",
+			name:        "waits for a fresh claimed PLZ setup",
 			plz:         true,
 			setupStatus: conditionStatus(metav1.ConditionUnknown),
+			setupReason: setupReasonClaimed,
 			wantState:   setupExecutionInProgress,
 			wantStatus:  metav1.ConditionUnknown,
+			wantReason:  setupReasonClaimed,
 		},
 		{
 			name:       "claims a PLZ setup when upgrading a resource without the condition",
 			plz:        true,
 			wantState:  setupExecutionClaimed,
 			wantStatus: metav1.ConditionUnknown,
+			wantReason: setupReasonClaimed,
 		},
 		{
 			name:        "does not claim setup for a non-PLZ test run",
 			setupStatus: conditionStatus(metav1.ConditionFalse),
 			wantState:   setupExecutionNotRequired,
 			wantStatus:  metav1.ConditionFalse,
+			wantReason:  v1alpha1.SetupExecuted + string(metav1.ConditionFalse),
 		},
 	}
 
@@ -65,7 +74,11 @@ func TestClaimSetupExecution(t *testing.T) {
 			t.Parallel()
 
 			ctx := context.Background()
-			r, objectKey := setupConditionTestReconciler(t, setupConditionTestRun(tt.plz, tt.setupStatus))
+			testRun := setupConditionTestRun(tt.plz, tt.setupStatus)
+			if tt.setupReason != "" {
+				setSetupTestCondition(t, testRun, *tt.setupStatus, tt.setupReason, time.Now().Add(-time.Minute))
+			}
+			r, objectKey := setupConditionTestReconciler(t, testRun)
 			current := getSetupConditionTestRun(t, ctx, r, objectKey)
 
 			state, err := claimSetupExecution(ctx, current, r, logr.Discard())
@@ -83,6 +96,9 @@ func TestClaimSetupExecution(t *testing.T) {
 			}
 			if condition.Status != tt.wantStatus {
 				t.Errorf("persisted SetupExecuted = %v, want %v", condition.Status, tt.wantStatus)
+			}
+			if condition.Reason != tt.wantReason {
+				t.Errorf("persisted reason = %q, want %q", condition.Reason, tt.wantReason)
 			}
 
 			if tt.wantState == setupExecutionClaimed {
@@ -204,6 +220,106 @@ func TestCompleteSetupExecutionAllowsStarter(t *testing.T) {
 	}
 }
 
+func TestClaimSetupExecutionRecoversPersistedPhases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		reason     string
+		message    string
+		wantState  setupExecutionState
+		wantStatus metav1.ConditionStatus
+		wantReason string
+	}{
+		{
+			name:       "finalizes a previously successful setup",
+			reason:     setupReasonSucceeded,
+			wantState:  setupExecutionCompleted,
+			wantStatus: metav1.ConditionTrue,
+			wantReason: "SetupExecutedTrue",
+		},
+		{
+			name:       "releases a persisted retryable failure",
+			reason:     setupReasonRetryableFailure,
+			wantState:  setupExecutionInProgress,
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "SetupExecutedFalse",
+		},
+		{
+			name:       "retains a non-retryable failure",
+			reason:     setupReasonFailed,
+			message:    "unsafe to replay",
+			wantState:  setupExecutionFailed,
+			wantStatus: metav1.ConditionUnknown,
+			wantReason: setupReasonFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			testRun := setupConditionTestRun(true, conditionStatus(metav1.ConditionUnknown))
+			setSetupTestCondition(t, testRun, metav1.ConditionUnknown, tt.reason, time.Now().Add(-time.Minute))
+			condition := meta.FindStatusCondition(testRun.Status.Conditions, v1alpha1.SetupExecuted)
+			condition.Message = tt.message
+			r, objectKey := setupConditionTestReconciler(t, testRun)
+			current := getSetupConditionTestRun(t, ctx, r, objectKey)
+
+			state, err := claimSetupExecution(ctx, current, r, logr.Discard())
+			if err != nil {
+				t.Fatalf("claimSetupExecution() error = %v", err)
+			}
+			if state != tt.wantState {
+				t.Errorf("state = %v, want %v", state, tt.wantState)
+			}
+
+			persisted := getSetupConditionTestRun(t, ctx, r, objectKey)
+			persistedCondition := meta.FindStatusCondition(persisted.Status.Conditions, v1alpha1.SetupExecuted)
+			if persistedCondition.Status != tt.wantStatus {
+				t.Errorf("status = %v, want %v", persistedCondition.Status, tt.wantStatus)
+			}
+			if persistedCondition.Reason != tt.wantReason {
+				t.Errorf("reason = %q, want %q", persistedCondition.Reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestClaimSetupExecutionExpiresOrphanedClaim(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	testRun := setupConditionTestRun(true, conditionStatus(metav1.ConditionUnknown))
+	setSetupTestCondition(
+		t,
+		testRun,
+		metav1.ConditionUnknown,
+		setupReasonClaimed,
+		time.Now().Add(-setupExecutionClaimTimeout-time.Minute),
+	)
+	r, objectKey := setupConditionTestReconciler(t, testRun)
+	current := getSetupConditionTestRun(t, ctx, r, objectKey)
+
+	state, err := claimSetupExecution(ctx, current, r, logr.Discard())
+	if err != nil {
+		t.Fatalf("claimSetupExecution() error = %v", err)
+	}
+	if state != setupExecutionFailed {
+		t.Fatalf("state = %v, want %v", state, setupExecutionFailed)
+	}
+
+	persisted := getSetupConditionTestRun(t, ctx, r, objectKey)
+	condition := meta.FindStatusCondition(persisted.Status.Conditions, v1alpha1.SetupExecuted)
+	if condition.Reason != setupReasonFailed {
+		t.Errorf("reason = %q, want %q", condition.Reason, setupReasonFailed)
+	}
+	if !strings.Contains(condition.Message, "replay is unsafe") {
+		t.Errorf("unexpected failure message: %q", condition.Message)
+	}
+}
+
 func TestSetupExecutionAllowsStarter(t *testing.T) {
 	t.Parallel()
 
@@ -215,6 +331,7 @@ func TestSetupExecutionAllowsStarter(t *testing.T) {
 		{state: setupExecutionClaimed, want: false},
 		{state: setupExecutionInProgress, want: false},
 		{state: setupExecutionCompleted, want: true},
+		{state: setupExecutionFailed, want: false},
 	}
 
 	for _, tt := range tests {
@@ -260,6 +377,23 @@ func setupConditionTestRun(
 			Conditions: conditions,
 		},
 	}
+}
+
+func setSetupTestCondition(
+	t *testing.T,
+	k6 *v1alpha1.TestRun,
+	status metav1.ConditionStatus,
+	reason string,
+	transition time.Time,
+) {
+	t.Helper()
+	condition := meta.FindStatusCondition(k6.Status.Conditions, v1alpha1.SetupExecuted)
+	if condition == nil {
+		t.Fatal("SetupExecuted condition is missing")
+	}
+	condition.Status = status
+	condition.Reason = reason
+	condition.LastTransitionTime = metav1.NewTime(transition)
 }
 
 func setupConditionTestReconciler(
