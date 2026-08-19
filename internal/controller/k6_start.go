@@ -94,9 +94,17 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 
 	// setup
 
-	if v1alpha1.IsTrue(k6, v1alpha1.CloudPLZTestRun) {
+	setupClaimed, err := claimSetupExecution(ctx, k6, r, log)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if setupClaimed {
 		if err, retry := runSetup(ctx, hostnames, log); err != nil {
 			if retry {
+				if resetErr := resetSetupExecution(ctx, k6, r, log); resetErr != nil {
+					return ctrl.Result{}, errors.Join(err, resetErr)
+				}
 				return ctrl.Result{}, err
 			}
 
@@ -140,4 +148,43 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 		return ctrl.Result{Requeue: true}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func claimSetupExecution(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) (bool, error) {
+	if !v1alpha1.IsTrue(k6, v1alpha1.CloudPLZTestRun) ||
+		v1alpha1.IsTrue(k6, v1alpha1.SetupExecuted) {
+		return false, nil
+	}
+
+	v1alpha1.UpdateCondition(k6, v1alpha1.SetupExecuted, metav1.ConditionTrue)
+	updated, err := r.UpdateStatus(ctx, k6, log)
+	if err != nil {
+		return false, err
+	}
+	if !updated && !v1alpha1.IsTrue(k6, v1alpha1.SetupExecuted) {
+		return false, errors.New("setup execution condition was not persisted")
+	}
+	return updated, nil
+}
+
+func resetSetupExecution(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) error {
+	v1alpha1.UpdateCondition(k6, v1alpha1.SetupExecuted, metav1.ConditionFalse)
+	updated, err := r.UpdateStatus(ctx, k6, log)
+	if err != nil {
+		return fmt.Errorf("resetting setup execution condition: %w", err)
+	}
+	if !updated && !v1alpha1.IsFalse(k6, v1alpha1.SetupExecuted) {
+		return errors.New("setup execution condition was not reset")
+	}
+	return nil
 }

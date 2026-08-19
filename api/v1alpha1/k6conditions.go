@@ -16,6 +16,11 @@ const (
 	// - if True, it's after successful starter but before all runners have finished
 	TestRunRunning = "TestRunRunning"
 
+	// SetupExecuted indicates whether the `setup()` execution has been claimed.
+	// It is persisted before invoking `setup()` to prevent duplicate execution during reconciliation.
+	// This condition can be used only in PLZ test runs.
+	SetupExecuted = "SetupExecuted"
+
 	// TeardownExecuted indicates whether the `teardown()` has been executed on one of the runners.
 	// This condition can be used only in PLZ test runs.
 	TeardownExecuted = "TeardownExecuted"
@@ -73,6 +78,13 @@ func Initialize(k6 *TestRun) {
 			Status:             metav1.ConditionUnknown,
 			LastTransitionTime: t,
 			Reason:             "TestRunPreparation",
+			Message:            "",
+		},
+		metav1.Condition{
+			Type:               SetupExecuted,
+			Status:             metav1.ConditionFalse,
+			LastTransitionTime: t,
+			Reason:             "SetupExecutedFalse",
 			Message:            "",
 		},
 		metav1.Condition{
