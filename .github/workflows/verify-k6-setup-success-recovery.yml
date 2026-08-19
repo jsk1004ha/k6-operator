@@ -49,9 +49,17 @@ jobs:
           for path in paths:
               normalized = []
               for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
-                  while line.startswith(r"\t"):
-                      line = "\t" + line[2:]
-                  normalized.append(line)
+                  indent = []
+                  while True:
+                      if line.startswith("\t"):
+                          indent.append("\t")
+                          line = line[1:]
+                      elif line.startswith(r"\t"):
+                          indent.append("\t")
+                          line = line[2:]
+                      else:
+                          break
+                  normalized.append("".join(indent) + line)
               path.write_text("".join(normalized), encoding="utf-8")
           PY
           gofmt -w \
