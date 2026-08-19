@@ -38,6 +38,7 @@ jobs:
         run: |
           python .trusted/.github/scripts/apply-k6-setup-success-recovery.py
           python - <<'PY'
+          import re
           from pathlib import Path
 
           paths = (
@@ -60,7 +61,10 @@ jobs:
                       else:
                           break
                   normalized.append("".join(indent) + line)
-              path.write_text("".join(normalized), encoding="utf-8")
+              text = "".join(normalized)
+              if path.name == "k6_start_test.go":
+                  text = re.sub(r"(?<!t)\bt\.setupData\b", "tt.setupData", text)
+              path.write_text(text, encoding="utf-8")
           PY
           gofmt -w \
             internal/controller/common.go \
