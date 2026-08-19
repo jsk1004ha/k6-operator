@@ -13,9 +13,25 @@ import (
 	"github.com/grafana/k6-operator/pkg/resources/jobs"
 	"go.k6.io/k6/v2/cloudapi"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+type setupExecutionState int
+
+const (
+	setupExecutionNotRequired setupExecutionState = iota
+	setupExecutionClaimed
+	setupExecutionInProgress
+	setupExecutionCompleted
+)
+
+func setupExecutionAllowsStarter(state setupExecutionState) bool {
+	return state == setupExecutionNotRequired || state == setupExecutionCompleted
+}
 
 func isServiceReady(log logr.Logger, service *v1.Service) bool {
 	resp, err := http.Get(fmt.Sprintf("http://%v:6565/v1/status", service.Spec.ClusterIP))
@@ -94,9 +110,17 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 
 	// setup
 
-	if v1alpha1.IsTrue(k6, v1alpha1.CloudPLZTestRun) {
-		if err, retry := runSetup(ctx, hostnames, log); err != nil {
-			if retry {
+	setupState, err := claimSetupExecution(ctx, k6, r, log)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if setupState == setupExecutionClaimed {
+		if err, retrySetup := runSetup(ctx, hostnames, log); err != nil {
+			if retrySetup {
+				if resetErr := resetSetupExecution(ctx, k6, r, log); resetErr != nil {
+					return ctrl.Result{}, errors.Join(err, resetErr)
+				}
 				return ctrl.Result{}, err
 			}
 
@@ -108,6 +132,17 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 
 			return ctrl.Result{Requeue: false}, nil
 		}
+
+		if err := completeSetupExecution(ctx, k6, r, log); err != nil {
+			return ctrl.Result{}, err
+		}
+		setupState = setupExecutionCompleted
+	}
+
+	// A second reconciliation may observe the claim while setup() is still
+	// running (or after a non-retryable failure). It must not start the test.
+	if !setupExecutionAllowsStarter(setupState) {
+		return res, nil
 	}
 
 	// starter
@@ -140,4 +175,89 @@ func StartJobs(ctx context.Context, log logr.Logger, k6 *v1alpha1.TestRun, r *Te
 		return ctrl.Result{Requeue: true}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func claimSetupExecution(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) (setupExecutionState, error) {
+	if !v1alpha1.IsTrue(k6, v1alpha1.CloudPLZTestRun) {
+		return setupExecutionNotRequired, nil
+	}
+
+	if condition := meta.FindStatusCondition(k6.Status.Conditions, v1alpha1.SetupExecuted); condition != nil {
+		switch condition.Status {
+		case metav1.ConditionTrue:
+			return setupExecutionCompleted, nil
+		case metav1.ConditionUnknown:
+			return setupExecutionInProgress, nil
+		}
+	}
+
+	base := k6.DeepCopy()
+	v1alpha1.UpdateCondition(k6, v1alpha1.SetupExecuted, metav1.ConditionUnknown)
+	if err := r.Status().Patch(
+		ctx,
+		k6,
+		client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}),
+	); err != nil {
+		log.Error(err, "Failed to persist setup execution claim")
+		return setupExecutionInProgress, err
+	}
+
+	return setupExecutionClaimed, nil
+}
+
+func completeSetupExecution(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) error {
+	return setSetupExecutionCondition(ctx, k6, r, log, metav1.ConditionTrue)
+}
+
+func resetSetupExecution(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+) error {
+	return setSetupExecutionCondition(ctx, k6, r, log, metav1.ConditionFalse)
+}
+
+func setSetupExecutionCondition(
+	ctx context.Context,
+	k6 *v1alpha1.TestRun,
+	r *TestRunReconciler,
+	log logr.Logger,
+	status metav1.ConditionStatus,
+) error {
+	key := k6.NamespacedName()
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &v1alpha1.TestRun{}
+		if err := r.Get(ctx, key, current); err != nil {
+			return err
+		}
+
+		base := current.DeepCopy()
+		v1alpha1.UpdateCondition(current, v1alpha1.SetupExecuted, status)
+		if err := r.Status().Patch(
+			ctx,
+			current,
+			client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}),
+		); err != nil {
+			return err
+		}
+
+		current.DeepCopyInto(k6)
+		return nil
+	})
+	if err != nil {
+		log.Error(err, "Failed to update setup execution condition", "status", status)
+		return fmt.Errorf("updating setup execution condition to %s: %w", status, err)
+	}
+	return nil
 }
