@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/grafana/k6-operator/api/v1alpha1"
@@ -160,8 +161,8 @@ func TestReconcileAddsCloudTestRunFinalizer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if !result.Requeue {
-		t.Error("Reconcile() did not request another pass after adding the finalizer")
+	if result.RequeueAfter != time.Second {
+		t.Errorf("RequeueAfter = %s, want one second after adding the finalizer", result.RequeueAfter)
 	}
 
 	persisted := &v1alpha1.TestRun{}
@@ -197,7 +198,7 @@ func TestFinalizeTestRunNotifiesCloudBeforeRemovingFinalizer(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	k6, secret := deletingPLZTestRun(server.URL+"/v1", "started")
+	k6, secret := deletingPLZTestRun(server.URL, "started")
 	key := k6.NamespacedName()
 	r := finalizerTestReconciler(t, k6, secret)
 
@@ -229,7 +230,7 @@ func TestFinalizeTestRunRetainsFinalizerWhenCloudFails(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	k6, secret := deletingPLZTestRun(server.URL+"/v1", "started")
+	k6, secret := deletingPLZTestRun(server.URL, "started")
 	r := finalizerTestReconciler(t, k6, secret)
 
 	result, err := r.finalizeTestRun(ctx, k6, logr.Discard())
@@ -248,7 +249,7 @@ func TestFinalizeTestRunRetainsFinalizerUntilTokenIsAvailable(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	k6, _ := deletingPLZTestRun("http://cloud.invalid/v1", "started")
+	k6, _ := deletingPLZTestRun("http://cloud.invalid", "started")
 	r := finalizerTestReconciler(t, k6)
 
 	result, err := r.finalizeTestRun(ctx, k6, logr.Discard())
@@ -274,7 +275,7 @@ func TestFinalizeFinishedTestRunSkipsAbort(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	k6, secret := deletingPLZTestRun(server.URL+"/v1", "finished")
+	k6, secret := deletingPLZTestRun(server.URL, "finished")
 	key := k6.NamespacedName()
 	r := finalizerTestReconciler(t, k6, secret)
 

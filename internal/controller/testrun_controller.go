@@ -90,7 +90,7 @@ func (r *TestRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Error(err, "Could not add TestRun finalizer")
 		return ctrl.Result{}, err
 	} else if finalizerAdded {
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	if k6.Spec.Parallelism < 1 {
